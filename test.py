@@ -13,7 +13,9 @@ import time
 import select
 import termios
 import tty
-from typing import Dict, Tuple, Optional
+import json
+from datetime import datetime
+from typing import Dict, Tuple, Optional, List
 
 # Import only from dynamixel module
 from lerobot.common.motors.dynamixel import (
@@ -27,6 +29,7 @@ from lerobot.common.motors import Motor, MotorCalibration, MotorNormMode
 # Constants
 PORT = "/dev/ttyACM0"
 CALIBRATION_FILE = "calibration.txt"
+CHAIN_TEST_FILE = "chain_test_results.txt"
 BAUDRATE = 1_000_000
 
 # Motor configuration
@@ -111,16 +114,35 @@ def load_calibration() -> Optional[Dict[str, MotorCalibration]]:
         return None
 
 
+def decode_if_negative(value: int, n_bytes: int = 4) -> int:
+    """Decode value as two's complement if it appears to be a negative value interpreted as unsigned"""
+    max_signed = (1 << (n_bytes * 8 - 1)) - 1  # Max positive value for signed integer
+    if value > max_signed:
+        # This is likely a negative value interpreted as unsigned
+        return value - (1 << (n_bytes * 8))
+    return value
+
+
 def is_position_valid(raw_pos: int, motor_name: str) -> bool:
     """Check if a position reading is valid (not corrupted)"""
-    # Check for obviously corrupted values (large numbers that indicate communication errors)
-    # These are typically close to 2^32 - 1 or negative values interpreted as unsigned
-    if raw_pos > 4290000000:  # Close to 2^32 - 1, indicates corrupted data
+    # First, try to decode if it's a negative value interpreted as unsigned
+    decoded_pos = decode_if_negative(raw_pos)
+    
+    # For extended position mode, valid range is much larger (±256 revolutions)
+    # XL330 has 4096 positions per revolution, so ±256 rev = ±1,048,576 positions
+    max_extended_position = 256 * 4096  # 1,048,576
+    
+    # Check if decoded position is within reasonable extended position range
+    if abs(decoded_pos) > max_extended_position:
         return False
     
-    # Check for reasonable range (Dynamixel XL330 has 0-4095 range, extended position allows more)
-    # But anything over 1 million is likely corrupted for normal operation
-    if raw_pos > 1000000 and raw_pos < 4290000000:
+    # If we decoded a negative value, update the raw_pos for further checks
+    if decoded_pos != raw_pos:
+        # This was a negative value, which is valid in extended position mode
+        return True
+    
+    # For positive values, check normal ranges
+    if raw_pos > 1000000:  # Anything over 1 million positive is suspicious
         return False
         
     return True
@@ -132,17 +154,27 @@ def read_positions_with_retry(bus: DynamixelMotorsBus, max_retries: int = 3) -> 
         try:
             positions = bus.sync_read("Present_Position", normalize=False)
             
-            # Validate all position readings
+            # Decode any negative values (two's complement) and validate
+            decoded_positions = {}
             invalid_motors = []
+            
             for motor_name, raw_pos in positions.items():
+                # First decode if it's a negative value
+                decoded_pos = decode_if_negative(raw_pos)
+                
+                # Check if position is valid (using decoded value)
                 if not is_position_valid(raw_pos, motor_name):
                     invalid_motors.append((motor_name, raw_pos))
+                else:
+                    # Store the decoded position
+                    decoded_positions[motor_name] = decoded_pos
             
             # If we have invalid readings and retries left, try again
             if invalid_motors and attempt < max_retries:
                 print(f"\n⚠️  Invalid position readings detected (attempt {attempt + 1}):")
                 for motor, pos in invalid_motors:
-                    print(f"   {motor}: {pos} (likely corrupted)")
+                    decoded = decode_if_negative(pos)
+                    print(f"   {motor}: {pos} (decoded: {decoded}) - likely corrupted")
                 print("   Retrying...")
                 time.sleep(0.01)  # Small delay before retry
                 continue
@@ -151,10 +183,11 @@ def read_positions_with_retry(bus: DynamixelMotorsBus, max_retries: int = 3) -> 
             if invalid_motors:
                 print(f"\n❌ Persistent communication errors after {max_retries} retries:")
                 for motor, pos in invalid_motors:
-                    print(f"   {motor}: {pos} (corrupted data)")
-                    positions[motor] = None  # Mark as invalid
+                    decoded = decode_if_negative(pos)
+                    print(f"   {motor}: {pos} (decoded: {decoded}) - corrupted data")
+                    decoded_positions[motor] = None  # Mark as invalid
             
-            return positions
+            return decoded_positions
             
         except Exception as e:
             if attempt < max_retries:
@@ -172,30 +205,47 @@ def read_positions_with_retry(bus: DynamixelMotorsBus, max_retries: int = 3) -> 
 def display_motor_values(bus: DynamixelMotorsBus, show_normalized: bool = True):
     """Display current motor positions with error detection"""
     try:
-        positions = read_positions_with_retry(bus, max_retries=2)
+        # Read raw positions directly for accurate display
+        raw_positions = bus.sync_read("Present_Position", normalize=False)
         
-        if not positions:
+        if not raw_positions:
             print("\n❌ Failed to read motor positions")
             return
         
         print("\nMotor Positions:")
-        print("-" * 70)
-        print(f"{'Motor':<15} {'Raw':<10} {'Normalized':<15} {'Status'}")
-        print("-" * 70)
+        print("-" * 90)
+        print(f"{'Motor':<15} {'Position':<20} {'Normalized':<15} {'Status'}")
+        print("-" * 90)
         
         error_count = 0
         for motor_name in MOTOR_CONFIG.keys():
-            raw_pos = positions.get(motor_name, None)
+            raw_pos = raw_positions.get(motor_name, None)
             
-            # Handle corrupted/invalid readings
+            # Handle missing readings
             if raw_pos is None:
-                print(f"{motor_name:<15} {'ERROR':<10} {'N/A':<15} {'COMM ERROR'}")
+                print(f"{motor_name:<15} {'ERROR':<15} {'N/A':<15} {'COMM ERROR'}")
                 error_count += 1
                 continue
-            elif not is_position_valid(raw_pos, motor_name):
-                print(f"{motor_name:<15} {raw_pos:<10} {'CORRUPTED':<15} {'DATA ERROR'}")
+            
+            # Decode if negative value (two's complement)
+            decoded_pos = decode_if_negative(raw_pos)
+            
+            # Debug for specific value
+            if raw_pos == 4294966982:
+                print(f"\n[DEBUG] Found 4294966982 → Decoded to: {decoded_pos}")
+            
+            # Check if position is valid
+            if not is_position_valid(raw_pos, motor_name):
+                print(f"{motor_name:<15} {str(raw_pos):<15} {'CORRUPTED':<15} {'DATA ERROR'}")
                 error_count += 1
                 continue
+            
+            # Display position - show decoded value if it was negative
+            if decoded_pos != raw_pos:
+                # This was a negative value - show decoded
+                pos_str = f"{decoded_pos}"
+            else:
+                pos_str = str(decoded_pos)  # Always use decoded value
             
             # Get normalized value if calibrated
             norm_str = "N/A"
@@ -209,26 +259,27 @@ def display_motor_values(bus: DynamixelMotorsBus, show_normalized: bool = True):
                     elif MOTOR_CONFIG[motor_name]["norm_mode"] == MotorNormMode.RANGE_0_100:
                         norm_str = f"{norm_pos:6.1f}%"
                     
-                    # Check if at limits
+                    # Check if at limits using decoded position
                     calib = bus.calibration.get(motor_name)
                     if calib:
-                        if raw_pos <= calib.range_min:
+                        if decoded_pos <= calib.range_min:
                             status = "MIN LIMIT"
-                        elif raw_pos >= calib.range_max:
+                        elif decoded_pos >= calib.range_max:
                             status = "MAX LIMIT"
                 except:
                     status = "NORM ERROR"
             
-            print(f"{motor_name:<15} {raw_pos:<10} {norm_str:<15} {status}")
+            print(f"{motor_name:<15} {pos_str:<20} {norm_str:<15} {status}")
+        
+        # Note about two's complement if we see any negative positions
+        has_negative = any(decode_if_negative(pos) != pos for pos in raw_positions.values() if pos is not None)
+        if has_negative:
+            print("-" * 80)
+            print("📍 Note: Negative positions detected and decoded from two's complement")
         
         if error_count > 0:
-            print("-" * 70)
+            print("-" * 80)
             print(f"⚠️  {error_count} motor(s) with communication errors")
-            print("   This suggests:")
-            print("   • Power supply issues under load")
-            print("   • Cable connection problems")
-            print("   • Electrical interference")
-            print("   • Timing issues in serial communication")
         
     except Exception as e:
         print(f"❌ Error in display function: {e}")
@@ -696,6 +747,663 @@ def test_teleoperation(bus: DynamixelMotorsBus):
         wait_for_enter()
 
 
+def save_chain_state(chain_data: dict):
+    """Save chain test results to JSON file"""
+    try:
+        with open(CHAIN_TEST_FILE, 'w') as f:
+            json.dump(chain_data, f, indent=2)
+        print(f"Chain state saved to {CHAIN_TEST_FILE}")
+    except Exception as e:
+        print(f"Error saving chain state: {e}")
+
+
+def load_chain_state() -> dict:
+    """Load chain test results from JSON file"""
+    if not os.path.exists(CHAIN_TEST_FILE):
+        # Initialize new chain state
+        return {
+            "chain_version": "1.0",
+            "test_date": datetime.now().isoformat(),
+            "current_chain": [],
+            "problematic_motors": [],
+            "test_sessions": [],
+            "available_motors": list(MOTOR_CONFIG.keys())
+        }
+    
+    try:
+        with open(CHAIN_TEST_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading chain state: {e}")
+        return load_chain_state()  # Return default if error
+
+
+def test_single_motor_isolated(motor_name: str, ensure_configured: bool = True) -> Tuple[bool, float, str]:
+    """Test a single motor in isolation
+    Returns: (success, error_rate, error_details)
+    """
+    print(f"\n🔍 Testing {motor_name} in isolation...")
+    
+    # Create a single motor bus
+    single_motor = {motor_name: Motor(
+        id=MOTOR_CONFIG[motor_name]["id"],
+        model=MOTOR_CONFIG[motor_name]["model"],
+        norm_mode=MOTOR_CONFIG[motor_name]["norm_mode"]
+    )}
+    
+    bus = DynamixelMotorsBus(
+        port=PORT,
+        motors=single_motor,
+        calibration=None
+    )
+    
+    try:
+        # Connect to the motor
+        bus.connect()
+        
+        # Configure if needed
+        if ensure_configured:
+            try:
+                bus.configure_motors()
+                print(f"   ✓ Motor configured")
+            except:
+                print(f"   ⚠ Motor already configured or configuration skipped")
+        
+        # Phase 1: Stationary test
+        print(f"\n📍 Phase 1: Stationary Communication Test")
+        print(f"   Testing communication while motor is stationary...")
+        stationary_error_count = 0
+        stationary_total = 10
+        stationary_corrupted = []
+        
+        for i in range(stationary_total):
+            try:
+                positions = bus.sync_read("Present_Position", normalize=False)
+                if motor_name in positions:
+                    pos = positions[motor_name]
+                    if not is_position_valid(pos, motor_name):
+                        stationary_error_count += 1
+                        stationary_corrupted.append(pos)
+                else:
+                    stationary_error_count += 1
+            except:
+                stationary_error_count += 1
+            
+            time.sleep(0.05)
+        
+        stationary_error_rate = (stationary_error_count / stationary_total) * 100
+        
+        if stationary_error_count == 0:
+            print(f"   ✅ Stationary test: PASSED (0% error rate)")
+        else:
+            print(f"   ❌ Stationary test: FAILED ({stationary_error_rate:.1f}% error rate)")
+            print(f"      Corrupted values: {stationary_corrupted}")
+        
+        # Phase 2: Movement/torque test
+        print(f"\n🔄 Phase 2: Movement & Torque Test")
+        print(f"   Now you can manually move/spin the {motor_name} motor.")
+        print(f"   Watch for communication errors during movement.")
+        print(f"   Try different positions, apply torque, etc.")
+        print(f"   Press ENTER when done testing movement...")
+        
+        movement_error_count = 0
+        movement_total = 0
+        movement_corrupted = []
+        position_history = []
+        
+        # Start continuous monitoring
+        print(f"\n   🔍 Monitoring {motor_name} - Move the motor now!")
+        print(f"   {'Read#':<6} {'Position':<10} {'Status':<12} {'Notes'}")
+        print(f"   {'-'*6} {'-'*10} {'-'*12} {'-'*20}")
+        
+        try:
+            while True:
+                # Check if user pressed enter
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rlist:
+                    key = sys.stdin.read(1)
+                    if key == '\n' or key == '\r':
+                        break
+                
+                movement_total += 1
+                
+                try:
+                    positions = bus.sync_read("Present_Position", normalize=False)
+                    if motor_name in positions:
+                        pos = positions[motor_name]
+                        position_history.append(pos)
+                        
+                        if not is_position_valid(pos, motor_name):
+                            movement_error_count += 1
+                            movement_corrupted.append(pos)
+                            status = "❌ CORRUPTED"
+                            notes = f"Value: {pos}"
+                        else:
+                            status = "✅ Valid"
+                            # Check if position changed significantly (movement detected)
+                            if len(position_history) > 5:
+                                recent_pos = position_history[-5:]
+                                pos_range = max(recent_pos) - min(recent_pos)
+                                if pos_range > 50:  # Significant movement
+                                    notes = "Movement detected"
+                                else:
+                                    notes = "Stationary"
+                            else:
+                                notes = "Starting..."
+                        
+                        print(f"\r   {movement_total:<6} {pos:<10} {status:<12} {notes}", end='', flush=True)
+                    else:
+                        movement_error_count += 1
+                        print(f"\r   {movement_total:<6} {'NO READ':<10} {'❌ COMM ERR':<12} {'No response'}", end='', flush=True)
+                        
+                except Exception as e:
+                    movement_error_count += 1
+                    print(f"\r   {movement_total:<6} {'ERROR':<10} {'❌ EXCEPTION':<12} {str(e)[:15]}", end='', flush=True)
+                
+                time.sleep(0.1)  # 10Hz monitoring
+                
+        except KeyboardInterrupt:
+            print(f"\n   Test interrupted by user")
+        
+        print(f"\n\n   📊 Movement Test Results:")
+        print(f"      Total reads: {movement_total}")
+        print(f"      Errors: {movement_error_count}")
+        
+        if movement_total > 0:
+            movement_error_rate = (movement_error_count / movement_total) * 100
+            print(f"      Error rate: {movement_error_rate:.2f}%")
+            
+            if movement_corrupted:
+                print(f"      Sample corrupted values: {movement_corrupted[:5]}")
+            
+            # Analyze position changes
+            if len(position_history) > 10:
+                valid_positions = [p for p in position_history if is_position_valid(p, motor_name)]
+                if valid_positions:
+                    pos_min = min(valid_positions)
+                    pos_max = max(valid_positions)
+                    pos_range = pos_max - pos_min
+                    print(f"      Position range: {pos_min} to {pos_max} (range: {pos_range})")
+                    
+                    if pos_range > 100:
+                        print(f"      ✅ Motor movement detected during test")
+                    else:
+                        print(f"      ⚠️  Limited movement detected")
+        
+        # Overall results
+        overall_error_count = stationary_error_count + movement_error_count
+        overall_total = stationary_total + movement_total
+        overall_error_rate = (overall_error_count / overall_total) * 100 if overall_total > 0 else 100
+        
+        print(f"\n   🎯 Overall Test Summary:")
+        print(f"      Stationary errors: {stationary_error_count}/{stationary_total} ({stationary_error_rate:.1f}%)")
+        if movement_total > 0:
+            print(f"      Movement errors: {movement_error_count}/{movement_total} ({movement_error_rate:.1f}%)")
+        print(f"      Combined error rate: {overall_error_rate:.1f}%")
+        
+        all_corrupted = stationary_corrupted + movement_corrupted
+        
+        if overall_error_rate == 0:
+            print(f"\n   ✅ {motor_name}: PASSED - No errors during stationary or movement testing")
+            error_details = ""
+            success = True
+        elif stationary_error_count > 0 and movement_error_count == 0:
+            print(f"\n   ⚠️  {motor_name}: Errors only when stationary - possible hardware issue")
+            error_details = f"Stationary errors: {stationary_error_rate:.1f}%, Movement: 0%"
+            success = False
+        elif stationary_error_count == 0 and movement_error_count > 0:
+            print(f"\n   ⚠️  {motor_name}: Errors only during movement - load/torque related")
+            error_details = f"Movement errors: {movement_error_rate:.1f}%, Stationary: 0%"
+            success = False
+        else:
+            print(f"\n   ❌ {motor_name}: Errors in both stationary and movement - serious communication issue")
+            error_details = f"Combined error rate: {overall_error_rate:.1f}%"
+            success = False
+        
+        if all_corrupted:
+            error_details += f", Sample corrupted: {all_corrupted[:3]}"
+        
+        bus.disconnect()
+        return success, overall_error_rate, error_details
+            
+    except Exception as e:
+        print(f"   ❌ {motor_name}: Connection failed - {e}")
+        return False, 100.0, str(e)
+    finally:
+        if bus.is_connected:
+            bus.disconnect()
+
+
+def test_motor_chain(chain_motors: List[str], test_duration: int = 5) -> Tuple[bool, dict]:
+    """Test all motors in the current chain
+    Returns: (success, test_results)
+    """
+    if not chain_motors:
+        return True, {"error": "No motors in chain"}
+    
+    print(f"\n🔗 Testing chain with {len(chain_motors)} motor(s)...")
+    print(f"   Chain: {' → '.join(chain_motors)}")
+    
+    # Create bus with chain motors
+    motors = {}
+    for motor_name in chain_motors:
+        motors[motor_name] = Motor(
+            id=MOTOR_CONFIG[motor_name]["id"],
+            model=MOTOR_CONFIG[motor_name]["model"],
+            norm_mode=MOTOR_CONFIG[motor_name]["norm_mode"]
+        )
+    
+    bus = DynamixelMotorsBus(
+        port=PORT,
+        motors=motors,
+        calibration=None
+    )
+    
+    try:
+        # Connect to the chain
+        print("   Connecting to chain...")
+        bus.connect()
+        print("   ✓ Connected")
+        
+        # Test communication stability
+        print(f"   Testing stability for {test_duration} seconds...")
+        
+        total_reads = 0
+        error_count = 0
+        motor_errors = {motor: 0 for motor in chain_motors}
+        corrupted_readings = {motor: [] for motor in chain_motors}
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < test_duration:
+            total_reads += 1
+            
+            try:
+                positions = bus.sync_read("Present_Position", normalize=False)
+                
+                for motor_name in chain_motors:
+                    if motor_name in positions:
+                        pos = positions[motor_name]
+                        if not is_position_valid(pos, motor_name):
+                            error_count += 1
+                            motor_errors[motor_name] += 1
+                            corrupted_readings[motor_name].append(pos)
+                    else:
+                        error_count += 1
+                        motor_errors[motor_name] += 1
+                        
+            except Exception as e:
+                error_count += 1
+                for motor in chain_motors:
+                    motor_errors[motor] += 1
+            
+            # Progress update
+            if total_reads % 20 == 0:
+                elapsed = time.time() - start_time
+                print(f"\r   Progress: {elapsed:.1f}s - {total_reads} reads - {error_count} errors", end='', flush=True)
+            
+            time.sleep(0.05)
+        
+        print()  # New line after progress
+        
+        # Calculate results
+        overall_error_rate = (error_count / (total_reads * len(chain_motors))) * 100
+        
+        motor_error_rates = {}
+        for motor, errors in motor_errors.items():
+            rate = (errors / total_reads) * 100
+            motor_error_rates[motor] = rate
+        
+        # Display results
+        print(f"\n   📊 Chain Test Results:")
+        print(f"      Total reads: {total_reads}")
+        print(f"      Overall error rate: {overall_error_rate:.2f}%")
+        
+        success = overall_error_rate < 5  # Less than 5% is considered stable
+        
+        if motor_errors:
+            print(f"\n   Motor-specific errors:")
+            for motor, errors in motor_errors.items():
+                rate = motor_error_rates[motor]
+                if errors > 0:
+                    print(f"      {motor}: {errors} errors ({rate:.1f}%)")
+                    if corrupted_readings[motor]:
+                        print(f"         Sample corrupted values: {corrupted_readings[motor][:3]}")
+                else:
+                    print(f"      {motor}: ✅ No errors")
+        
+        bus.disconnect()
+        
+        return success, {
+            "total_reads": total_reads,
+            "error_count": error_count,
+            "overall_error_rate": overall_error_rate,
+            "motor_error_rates": motor_error_rates,
+            "corrupted_readings": corrupted_readings
+        }
+        
+    except Exception as e:
+        print(f"   ❌ Chain test failed: {e}")
+        return False, {"error": str(e)}
+    finally:
+        if bus.is_connected:
+            bus.disconnect()
+
+
+def chain_builder_mode():
+    """Interactive chain builder mode for systematic motor testing"""
+    chain_state = load_chain_state()
+    session_id = len(chain_state["test_sessions"]) + 1
+    
+    while True:
+        clear_screen()
+        print("=== CHAIN BUILDER MODE ===")
+        print("\nSystematically build and test motor chains to identify communication issues.")
+        
+        # Display current chain
+        current_chain = chain_state["current_chain"]
+        if current_chain:
+            print(f"\n🔗 Current Chain ({len(current_chain)} motors):")
+            chain_display = " → ".join([m["motor_name"] for m in current_chain])
+            print(f"   {chain_display}")
+            
+            # Show chain health
+            error_motors = [m for m in current_chain if m.get("error_count", 0) > 0]
+            if error_motors:
+                print(f"   ⚠️  {len(error_motors)} motor(s) with errors")
+            else:
+                print(f"   ✅ All motors stable")
+        else:
+            print("\n🔗 Current Chain: Empty")
+        
+        # Display problematic motors
+        if chain_state["problematic_motors"]:
+            print(f"\n❌ Problematic Motors ({len(chain_state['problematic_motors'])}):")
+            for motor in chain_state["problematic_motors"]:
+                print(f"   {motor['motor_name']} - Failed at chain length {motor['failed_at_chain_length']}")
+        
+        # Available motors
+        motors_in_chain = [m["motor_name"] for m in current_chain]
+        problematic_names = [m["motor_name"] for m in chain_state["problematic_motors"]]
+        available = [m for m in MOTOR_CONFIG.keys() 
+                    if m not in motors_in_chain and m not in problematic_names]
+        
+        if available:
+            print(f"\n📦 Available Motors: {', '.join(available)}")
+            if available:
+                print(f"   Next suggested: {available[0]}")
+        
+        # Menu options
+        print("\nOptions:")
+        if available:
+            print("1. Test Next Motor (Isolated)")
+            print("2. Add Next Motor to Chain")
+        if current_chain:
+            print("3. Test Current Chain")
+            print("4. Remove Last Motor")
+        print("5. View Detailed Results")
+        print("6. Reset Chain")
+        print("7. Save & Exit")
+        print("ESC - Return to Main Menu")
+        
+        print("\nInstructions:")
+        if not current_chain:
+            print("   • Start by testing motors individually")
+            print("   • Successfully tested motors can be added to the chain")
+        else:
+            print(f"   • Current entry point: {current_chain[0]['motor_name']}")
+            print("   • Connect motors in order shown above")
+        
+        print("\nSelect option: ", end='', flush=True)
+        
+        key = get_key_press(timeout=None)
+        
+        if key == '\x1b' or key == '\x1b[':  # ESC
+            save_chain_state(chain_state)
+            break
+        
+        elif key == '1' and available:
+            # Test motor isolated - let user select which one
+            clear_screen()
+            print("=== SELECT MOTOR FOR ISOLATED TESTING ===")
+            print("\nAvailable motors for testing:")
+            
+            for i, motor in enumerate(available, 1):
+                motor_id = MOTOR_CONFIG[motor]["id"]
+                print(f"{i}. {motor} (ID: {motor_id})")
+            
+            print("\nESC - Return to main menu")
+            print("\nSelect motor to test (1-{}): ".format(len(available)), end='', flush=True)
+            
+            motor_key = get_key_press(timeout=None)
+            
+            if motor_key == '\x1b' or motor_key == '\x1b[':  # ESC
+                continue
+            
+            if motor_key and motor_key.isdigit():
+                motor_idx = int(motor_key) - 1
+                if 0 <= motor_idx < len(available):
+                    selected_motor = available[motor_idx]
+                    
+                    print(f"\n\n=== TESTING {selected_motor.upper()} (ISOLATED) ===")
+                    print(f"\nConnect ONLY the {selected_motor} motor and press ENTER...")
+                    wait_for_enter()
+                    
+                    success, error_rate, error_details = test_single_motor_isolated(selected_motor)
+                    
+                    if success:
+                        print(f"\n✅ {selected_motor} passed isolated test!")
+                        print("You can now add it to the chain.")
+                    else:
+                        print(f"\n❌ {selected_motor} failed isolated test!")
+                        print("This motor has communication issues even when alone.")
+                        
+                        # Add to problematic motors
+                        chain_state["problematic_motors"].append({
+                            "motor_name": selected_motor,
+                            "id": MOTOR_CONFIG[selected_motor]["id"],
+                            "failed_at_chain_length": 0,
+                            "error_type": "isolated_test_failure",
+                            "error_details": error_details,
+                            "error_rate": error_rate
+                        })
+                    
+                    wait_for_enter()
+                else:
+                    print("\nInvalid selection!")
+                    time.sleep(1)
+            else:
+                print("\nInvalid selection!")
+                time.sleep(1)
+        
+        elif key == '2' and available:
+            # Add next motor to chain
+            next_motor = available[0]
+            
+            # First test it isolated
+            print(f"\n\n=== ADDING {next_motor.upper()} TO CHAIN ===")
+            print(f"\nFirst, testing {next_motor} in isolation...")
+            print(f"Connect ONLY the {next_motor} motor and press ENTER...")
+            wait_for_enter()
+            
+            success, error_rate, error_details = test_single_motor_isolated(next_motor)
+            
+            if not success:
+                print(f"\n❌ {next_motor} failed isolated test! Cannot add to chain.")
+                chain_state["problematic_motors"].append({
+                    "motor_name": next_motor,
+                    "id": MOTOR_CONFIG[next_motor]["id"],
+                    "failed_at_chain_length": len(current_chain),
+                    "error_type": "pre_chain_test_failure",
+                    "error_details": error_details,
+                    "error_rate": error_rate
+                })
+                wait_for_enter()
+                continue
+            
+            # Now test with chain
+            print(f"\n✅ {next_motor} passed isolated test!")
+            print(f"\nNow connect the chain:")
+            if current_chain:
+                chain_order = [m["motor_name"] for m in current_chain] + [next_motor]
+                print(f"   {' → '.join(chain_order)}")
+            else:
+                print(f"   Just {next_motor}")
+            print(f"\nEntry point: {current_chain[0]['motor_name'] if current_chain else next_motor}")
+            print("\nPress ENTER when chain is connected...")
+            wait_for_enter()
+            
+            # Test the new chain
+            test_chain = [m["motor_name"] for m in current_chain] + [next_motor]
+            success, results = test_motor_chain(test_chain)
+            
+            if success:
+                print(f"\n✅ Chain test PASSED! {next_motor} works well in the chain.")
+                
+                # Add to chain
+                chain_state["current_chain"].append({
+                    "motor_name": next_motor,
+                    "id": MOTOR_CONFIG[next_motor]["id"],
+                    "position": len(current_chain) + 1,
+                    "added_timestamp": datetime.now().isoformat(),
+                    "test_status": "pass",
+                    "error_count": 0,
+                    "error_rate": results.get("motor_error_rates", {}).get(next_motor, 0)
+                })
+            else:
+                print(f"\n❌ Chain test FAILED! Adding {next_motor} causes communication errors.")
+                
+                # Determine which motor(s) failed
+                if "motor_error_rates" in results:
+                    failed_motors = [(m, rate) for m, rate in results["motor_error_rates"].items() if rate > 5]
+                    
+                    for motor, rate in failed_motors:
+                        if motor == next_motor:
+                            print(f"   • {motor} is causing new errors ({rate:.1f}% error rate)")
+                        else:
+                            print(f"   • {motor} started failing after adding {next_motor} ({rate:.1f}% error rate)")
+                
+                # Add to problematic motors
+                chain_state["problematic_motors"].append({
+                    "motor_name": next_motor,
+                    "id": MOTOR_CONFIG[next_motor]["id"],
+                    "failed_at_chain_length": len(current_chain) + 1,
+                    "error_type": "chain_communication_failure",
+                    "error_details": str(results),
+                    "error_rate": results.get("motor_error_rates", {}).get(next_motor, 100)
+                })
+            
+            # Save session data
+            chain_state["test_sessions"].append({
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "action": "add_motor",
+                "motor": next_motor,
+                "chain_before": [m["motor_name"] for m in current_chain],
+                "success": success,
+                "results": results
+            })
+            
+            save_chain_state(chain_state)
+            wait_for_enter()
+        
+        elif key == '3' and current_chain:
+            # Test current chain
+            print("\n\n=== TESTING CURRENT CHAIN ===")
+            chain_motors = [m["motor_name"] for m in current_chain]
+            print(f"\nEnsure chain is connected: {' → '.join(chain_motors)}")
+            print(f"Entry point: {chain_motors[0]}")
+            print("\nPress ENTER to start test...")
+            wait_for_enter()
+            
+            success, results = test_motor_chain(chain_motors, test_duration=10)
+            
+            # Update chain state with results
+            if "motor_error_rates" in results:
+                for motor in current_chain:
+                    motor["error_rate"] = results["motor_error_rates"].get(motor["motor_name"], 0)
+                    motor["test_status"] = "pass" if motor["error_rate"] < 5 else "fail"
+            
+            save_chain_state(chain_state)
+            wait_for_enter()
+        
+        elif key == '4' and current_chain:
+            # Remove last motor
+            removed = current_chain.pop()
+            print(f"\n✓ Removed {removed['motor_name']} from chain")
+            
+            # Remove from problematic if it was there
+            chain_state["problematic_motors"] = [
+                m for m in chain_state["problematic_motors"] 
+                if m["motor_name"] != removed["motor_name"]
+            ]
+            
+            save_chain_state(chain_state)
+            time.sleep(1)
+        
+        elif key == '5':
+            # View detailed results
+            clear_screen()
+            print("=== DETAILED CHAIN TEST RESULTS ===")
+            
+            print(f"\nChain Version: {chain_state['chain_version']}")
+            print(f"Test Date: {chain_state['test_date']}")
+            
+            if current_chain:
+                print(f"\n✅ Working Chain ({len(current_chain)} motors):")
+                for i, motor in enumerate(current_chain, 1):
+                    status = "✅" if motor.get("test_status") == "pass" else "❌"
+                    error_rate = motor.get("error_rate", 0)
+                    print(f"   {i}. {motor['motor_name']} - {status} ({error_rate:.1f}% errors)")
+            
+            if chain_state["problematic_motors"]:
+                print(f"\n❌ Problematic Motors ({len(chain_state['problematic_motors'])}):")
+                for motor in chain_state["problematic_motors"]:
+                    print(f"\n   {motor['motor_name']} (ID: {motor['id']})")
+                    print(f"      Failed at chain length: {motor['failed_at_chain_length']}")
+                    print(f"      Error type: {motor['error_type']}")
+                    print(f"      Error rate: {motor.get('error_rate', 'N/A')}%")
+                    if motor.get("error_details"):
+                        print(f"      Details: {motor['error_details'][:100]}...")
+            
+            if chain_state["test_sessions"]:
+                print(f"\n📊 Recent Test Sessions (last 5):")
+                for session in chain_state["test_sessions"][-5:]:
+                    print(f"\n   Session {session['session_id']} - {session['timestamp'][:19]}")
+                    print(f"      Action: {session['action']}")
+                    if "motor" in session:
+                        print(f"      Motor: {session['motor']}")
+                    print(f"      Success: {'✅' if session['success'] else '❌'}")
+            
+            wait_for_enter()
+        
+        elif key == '6':
+            # Reset chain
+            print("\n\n⚠️  This will clear all chain data and start fresh.")
+            print("Are you sure? (y/N): ", end='', flush=True)
+            confirm = input().strip().lower()
+            
+            if confirm == 'y':
+                chain_state = {
+                    "chain_version": "1.0",
+                    "test_date": datetime.now().isoformat(),
+                    "current_chain": [],
+                    "problematic_motors": [],
+                    "test_sessions": [],
+                    "available_motors": list(MOTOR_CONFIG.keys())
+                }
+                save_chain_state(chain_state)
+                print("✓ Chain reset complete!")
+                time.sleep(1)
+        
+        elif key == '7':
+            # Save and exit
+            save_chain_state(chain_state)
+            print("\n✓ Chain state saved!")
+            time.sleep(1)
+            break
+
+
 def main():
     """Main program loop"""
     # Initialize motor configuration
@@ -741,6 +1449,8 @@ def main():
         if bus.is_connected:
             print("4. System Diagnostics")
             print("5. Optimize Communication")
+        print("6. Chain Builder Mode")
+        if bus.is_connected:
             print("D. Disconnect")
         else:
             print("C. Connect to motors")
@@ -803,6 +1513,10 @@ def main():
                 print("\n❌ Optimization failed. Check connection and try again.")
             
             wait_for_enter()
+        
+        elif key == '6':
+            # Chain builder mode
+            chain_builder_mode()
         
         elif key and key.upper() == 'C' and not bus.is_connected:
             print("\n\nConnecting to motors...")
