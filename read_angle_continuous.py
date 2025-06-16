@@ -14,7 +14,7 @@ from lerobot.common.motors.dynamixel import DynamixelMotorsBus
 
 # Default configuration
 DEFAULT_PORT = "/dev/ttyACM0"
-DEFAULT_MOTOR_ID = 4
+DEFAULT_MOTOR_ID = 5
 UPDATE_RATE = 10  # Hz
 
 # Parse command line arguments
