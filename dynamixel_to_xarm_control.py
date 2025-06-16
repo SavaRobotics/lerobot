@@ -20,7 +20,6 @@ DEFAULT_PORT = "/dev/ttyACM0"
 DEFAULT_MOTOR_ID = 1
 UPDATE_RATE = 10  # Hz
 XARM_IP = "192.168.1.197"
-ANGLE_THRESHOLD = 0.5  # degrees - minimum change to trigger xarm movement
 SAFETY_RANGE = 60.0  # degrees - max deviation from initial xarm position
 
 
@@ -33,7 +32,6 @@ print(f"Dynamixel Port: {port}")
 print(f"Dynamixel Motor ID: {motor_id}")
 print(f"xarm IP: {XARM_IP}")
 print(f"Update rate: {UPDATE_RATE} Hz")
-print(f"Angle threshold: {ANGLE_THRESHOLD}°")
 print(f"Safety range: ±{SAFETY_RANGE}°")
 print()
 
@@ -114,28 +112,25 @@ try:
         xarm_target_limited = max(xarm_initial - SAFETY_RANGE, 
                                  min(xarm_initial + SAFETY_RANGE, xarm_target))
         
-        # Check if movement is significant enough and within bounds
-        if abs(xarm_target_limited - last_xarm_target) > ANGLE_THRESHOLD:
-            # Get current angles for all joints
-            code, current_angles = arm.get_servo_angle(is_radian=False)
-            if code == 0:
-                # Update only J1
-                current_angles[0] = xarm_target_limited
-                # Convert degrees to radians (xarm expects radians despite is_radian parameter)
-                angles_rad = [math.radians(angle) for angle in current_angles]
-                # Send command to xarm with all joint angles
-                code = arm.set_servo_angle_j(angles_rad, wait=False, is_radian=True)
-                if code == 9:
-                    # Error 9 means not ready - try to re-enable
-                    arm.set_state(0)
-                    status = "NOT_READY"
-                else:
-                    last_xarm_target = xarm_target_limited
-                    status = "MOVING" if code == 0 else f"ERROR({code})"
+        # Send movement command (no threshold check)
+        # Get current angles for all joints
+        code, current_angles = arm.get_servo_angle(is_radian=False)
+        if code == 0:
+            # Update only J1
+            current_angles[0] = xarm_target_limited
+            # Convert degrees to radians (xarm expects radians despite is_radian parameter)
+            angles_rad = [math.radians(angle) for angle in current_angles]
+            # Send command to xarm with all joint angles
+            code = arm.set_servo_angle_j(angles_rad, wait=False, is_radian=True)
+            if code == 9:
+                # Error 9 means not ready - try to re-enable
+                arm.set_state(0)
+                status = "NOT_READY"
             else:
-                status = f"READ_ERROR({code})"
+                last_xarm_target = xarm_target_limited
+                status = "MOVING" if code == 0 else f"ERROR({code})"
         else:
-            status = "HOLD"
+            status = f"READ_ERROR({code})"
         
         # Determine if clamped
         clamped = abs(xarm_target - xarm_target_limited) > 0.01
