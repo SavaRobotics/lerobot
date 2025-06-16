@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Continuously read Dynamixel servo angle and control xarm joint 1 accordingly.
+Continuously read two Dynamixel servo angles and control xarm joints 1 and 2 accordingly.
 The xarm will follow the Dynamixel movements within a safe range.
 Press Ctrl+C to stop.
 
-Usage: python dynamixel_to_xarm_control.py [port] [motor_id]
+Usage: python dynamixel_to_xarm_control.py
 """
 
-import sys
 import time
 import math
 from lerobot.common.motors import Motor, MotorNormMode
@@ -15,43 +14,41 @@ from lerobot.common.motors.dynamixel import DynamixelMotorsBus
 from xarm.wrapper import XArmAPI
 
 
-# Default configuration
-DEFAULT_PORT = "/dev/ttyACM0"
-DEFAULT_MOTOR_ID = 1
+# Configuration
+PORT = "/dev/ttyACM0"
 UPDATE_RATE = 10  # Hz
 XARM_IP = "192.168.1.197"
 SAFETY_RANGE = 60.0  # degrees - max deviation from initial xarm position
 
-
-# Parse command line arguments
-port = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PORT
-motor_id = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_MOTOR_ID
-
-print(f"=== Dynamixel to xarm Control ===")
-print(f"Dynamixel Port: {port}")
-print(f"Dynamixel Motor ID: {motor_id}")
-print(f"xarm IP: {XARM_IP}")
+print(f"=== Dual Dynamixel to xarm Control ===")
+print(f"Dynamixel Port: {PORT}")
+print(f"Dynamixel IDs: 1 (→ xarm J1), 2 (→ xarm J2)")
+print(f"xarm IP: {XARM_IP}")  
 print(f"Update rate: {UPDATE_RATE} Hz")
 print(f"Safety range: ±{SAFETY_RANGE}°")
 print()
 
-# Setup Dynamixel motor
-motors = {"servo": Motor(id=motor_id, model="xl330-m077", norm_mode=MotorNormMode.RANGE_M100_100)}
-bus = DynamixelMotorsBus(port=port, motors=motors)
+# Setup both Dynamixel motors
+motors = {
+    "servo1": Motor(id=1, model="xl330-m077", norm_mode=MotorNormMode.RANGE_M100_100),
+    "servo2": Motor(id=2, model="xl330-m077", norm_mode=MotorNormMode.RANGE_M100_100)
+}
+bus = DynamixelMotorsBus(port=PORT, motors=motors)
 
 # Setup xarm
 arm = XArmAPI(XARM_IP)
 
 # Variables to store initial positions
-dynamixel_initial = None
-xarm_initial = None
-last_xarm_target = None
+dynamixel1_initial = None
+dynamixel2_initial = None
+xarm_j1_initial = None
+xarm_j2_initial = None
 
 try:
     # Connect to Dynamixel
-    print("Connecting to Dynamixel servo...")
+    print("Connecting to Dynamixel servos...")
     bus.connect()
-    print("Dynamixel connected!")
+    print("Dynamixel servos connected!")
     
     # Connect to xarm
     print("Connecting to xarm...")
@@ -66,58 +63,78 @@ try:
     # Record initial positions
     print("\nRecording initial positions...")
     
-    # Get initial Dynamixel position
-    position = bus.read("Present_Position", "servo", normalize=False)
-    if position > 2147483647:  # 2^31 - 1
-        decoded_position = position - 4294967296  # 2^32
+    # Get initial Dynamixel 1 position
+    position1 = bus.read("Present_Position", "servo1", normalize=False)
+    if position1 > 2147483647:  # 2^31 - 1
+        decoded_position1 = position1 - 4294967296  # 2^32
     else:
-        decoded_position = position
-    dynamixel_initial = (decoded_position / 4096) * 360
+        decoded_position1 = position1
+    dynamixel1_initial = (decoded_position1 / 4096) * 360
+    
+    # Get initial Dynamixel 2 position  
+    position2 = bus.read("Present_Position", "servo2", normalize=False)
+    if position2 > 2147483647:  # 2^31 - 1
+        decoded_position2 = position2 - 4294967296  # 2^32
+    else:
+        decoded_position2 = position2
+    dynamixel2_initial = (decoded_position2 / 4096) * 360
     
     # Get initial xarm positions (all joints)
     code, xarm_angles = arm.get_servo_angle(is_radian=False)
     if code != 0:
         raise Exception(f"Failed to get xarm angles, code: {code}")
-    xarm_initial = xarm_angles[0]  # Store J1 initial position
-    last_xarm_target = xarm_initial
+    xarm_j1_initial = xarm_angles[0]  # Store J1 initial position
+    xarm_j2_initial = xarm_angles[1]  # Store J2 initial position
     
-    print(f"Initial Dynamixel angle: {dynamixel_initial:.2f}°")
-    print(f"Initial xarm J1 angle: {xarm_initial:.2f}°")
-    print(f"xarm will move within [{xarm_initial-SAFETY_RANGE:.1f}°, {xarm_initial+SAFETY_RANGE:.1f}°]")
+    print(f"Initial Dynamixel 1 angle: {dynamixel1_initial:.2f}°")
+    print(f"Initial Dynamixel 2 angle: {dynamixel2_initial:.2f}°")
+    print(f"Initial xarm J1 angle: {xarm_j1_initial:.2f}°")
+    print(f"Initial xarm J2 angle: {xarm_j2_initial:.2f}°")
+    print(f"xarm J1 will move within [{xarm_j1_initial-SAFETY_RANGE:.1f}°, {xarm_j1_initial+SAFETY_RANGE:.1f}°]")
+    print(f"xarm J2 will move within [{xarm_j2_initial-SAFETY_RANGE:.1f}°, {xarm_j2_initial+SAFETY_RANGE:.1f}°]")
     print("\nStarting control loop (Ctrl+C to stop)...")
-    print("Dynamixel → xarm | Target | Status")
+    print("Dyn1→xArm1 | Dyn2→xArm2 | Status")
     print("-" * 40)
     
     # Continuous control loop
     while True:
-        # Read current Dynamixel position
-        position = bus.read("Present_Position", "servo", normalize=False)
-        
-        # Decode two's complement if negative (for Extended Position Mode)
-        if position > 2147483647:  # 2^31 - 1
-            decoded_position = position - 4294967296  # 2^32
+        # Read current Dynamixel 1 position
+        position1 = bus.read("Present_Position", "servo1", normalize=False)
+        if position1 > 2147483647:  # 2^31 - 1
+            decoded_position1 = position1 - 4294967296  # 2^32
         else:
-            decoded_position = position
+            decoded_position1 = position1
+        dynamixel1_current = (decoded_position1 / 4096) * 360
         
-        # Convert to degrees
-        dynamixel_current = (decoded_position / 4096) * 360
+        # Read current Dynamixel 2 position
+        position2 = bus.read("Present_Position", "servo2", normalize=False)
+        if position2 > 2147483647:  # 2^31 - 1
+            decoded_position2 = position2 - 4294967296  # 2^32
+        else:
+            decoded_position2 = position2
+        dynamixel2_current = (decoded_position2 / 4096) * 360
         
-        # Calculate change from initial position
-        dynamixel_change = dynamixel_current - dynamixel_initial
+        # Calculate changes from initial positions
+        dynamixel1_change = dynamixel1_current - dynamixel1_initial
+        dynamixel2_change = dynamixel2_current - dynamixel2_initial
         
-        # Calculate target xarm angle
-        xarm_target = xarm_initial + dynamixel_change
+        # Calculate target xarm angles
+        xarm_j1_target = xarm_j1_initial + dynamixel1_change
+        xarm_j2_target = xarm_j2_initial - dynamixel2_change
         
         # Apply safety limits
-        xarm_target_limited = max(xarm_initial - SAFETY_RANGE, 
-                                 min(xarm_initial + SAFETY_RANGE, xarm_target))
+        xarm_j1_limited = max(xarm_j1_initial - SAFETY_RANGE, 
+                             min(xarm_j1_initial + SAFETY_RANGE, xarm_j1_target))
+        xarm_j2_limited = max(xarm_j2_initial - SAFETY_RANGE, 
+                             min(xarm_j2_initial + SAFETY_RANGE, xarm_j2_target))
         
         # Send movement command (no threshold check)
         # Get current angles for all joints
         code, current_angles = arm.get_servo_angle(is_radian=False)
         if code == 0:
-            # Update only J1
-            current_angles[0] = xarm_target_limited
+            # Update J1 and J2
+            current_angles[0] = xarm_j1_limited
+            current_angles[1] = xarm_j2_limited
             # Convert degrees to radians (xarm expects radians despite is_radian parameter)
             angles_rad = [math.radians(angle) for angle in current_angles]
             # Send command to xarm with all joint angles
@@ -127,18 +144,21 @@ try:
                 arm.set_state(0)
                 status = "NOT_READY"
             else:
-                last_xarm_target = xarm_target_limited
                 status = "MOVING" if code == 0 else f"ERROR({code})"
         else:
             status = f"READ_ERROR({code})"
         
         # Determine if clamped
-        clamped = abs(xarm_target - xarm_target_limited) > 0.01
-        if clamped:
-            status += " CLAMPED"
+        j1_clamped = abs(xarm_j1_target - xarm_j1_limited) > 0.01
+        j2_clamped = abs(xarm_j2_target - xarm_j2_limited) > 0.01
+        if j1_clamped or j2_clamped:
+            clamp_status = ""
+            if j1_clamped: clamp_status += "J1"
+            if j2_clamped: clamp_status += "J2"
+            status += f" CLAMP({clamp_status})"
         
         # Display status
-        print(f"\r{dynamixel_current:6.1f}° → {xarm_target_limited:6.1f}° | {xarm_target:6.1f}° | {status:12s}", 
+        print(f"\r{dynamixel1_current:5.1f}°→{xarm_j1_limited:5.1f}° | {dynamixel2_current:5.1f}°→{xarm_j2_limited:5.1f}° | {status:15s}", 
               end='', flush=True)
         
         # Control update rate
